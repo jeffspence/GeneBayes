@@ -16,27 +16,56 @@ def integrate(these_params, these_likelihoods, logit=True):
     result = 0
 
     grid = torch.linspace(-1., 1., N_INTEGRATION_PTS).expand(1, -1)
-    means = Prior.get_mean(these_params)
-    sds = Prior.get_sd(these_params)
-    grid = means.expand(-1, 1) + grid * 8 * sds.expand(-1, 1)
+    means_s_het, means_s_hom = Prior.get_mean(these_params)
+    sds_s_het, sds_s_hom = Prior.get_sd(these_params)
+    grid_s_het = (
+        means_s_het.expand(-1, 1) + grid * 8 * sds_s_het.expand(-1, 1)
+    )
+    grid_s_hom = (
+        means_s_hom.expand(-1, 1) + grid * 8 * sds_s_hom.expand(-1, 1)
+    )
+
+    tile_grid_s_het = grid_s_het.repeat_interleave(len(grid_s_hom))
+    tile_grid_s_hom = grid_s_hom.repeat(len(grid_s_het))
 
     eval_at_pts, prior_p = log_prob(Prior.distribution,
                                     these_params,
                                     these_likelihoods,
-                                    grid,
+                                    tile_grid_s_het,
+                                    tile_grid_s_hom,
                                     logit=logit)
 
-    m = torch.max(eval_at_pts, dim=1, keepdim=True)[0]
+    eval_at_pts = eval_at_pts.reshape(-1, len(grid_s_het), len(grid_s_hom))
+
+    m = torch.max(
+        torch.max(eval_at_pts, dim=1, keepdim=True)[0],
+        dim=2,
+        keepdim=True
+    )[0]
     pdf = eval_at_pts - m
 
     result += torch.exp(m.squeeze())*torch.trapezoid(
-        torch.exp(pdf), grid, dim=1
+        torch.trapezoid(
+            torch.exp(pdf), grid_s_hom, dim=2
+        ),
+        grid_s_het,
+        dim=1
     )
 
-    m = torch.max(prior_p, dim=1, keepdim=True)[0]
+    m = torch.max(
+        torch.max(prior_p, dim=1, keepdim=True)[0],
+        dim=2,
+        keepdim=True
+    )[0]
+
     check = torch.exp(m.squeeze())*torch.trapezoid(
-        torch.exp(prior_p - m), grid, dim=1
+        torch.trapezoid(
+            torch.exp(prior_p - m), grid_s_hom, dim=2
+        ),
+        grid_s_het,
+        dim=1
     )
+
     if np.any(np.abs(check.detach().cpu().numpy() - 1.) > 1e-5):
         bad_idx = np.argmax(np.abs(check.detach().cpu().numpy()-1.))
         print('Discrepancy of ',
@@ -44,8 +73,8 @@ def integrate(these_params, these_likelihoods, logit=True):
               'found while integrating')
         print('params were', [p[bad_idx] for p in these_params])
         print(torch.exp(prior_p[bad_idx, 0]), torch.exp(prior_p[bad_idx, -1]))
-        print('mean was', means[bad_idx])
-        print('sd was', sds[bad_idx])
+        print('mean was', means_s_het[bad_idx], means_s_hom[bad_idx])
+        print('sd was', sds_s_het[bad_idx], sds_s_hom[bad_idx])
         print('grid was', grid[bad_idx])
 
     return result
@@ -313,59 +342,106 @@ class PriorScore(LogScore):
 
 
 def log_prob(
-    prior_dist, these_params, these_likelihoods, gene_property, logit=True
+    prior_dist, these_params, these_likelihoods, s_het, s_hom, logit=True
 ):
-    prior_p = prior_dist(these_params, logit).log_prob(gene_property)
+    prior_p = prior_dist(these_params, logit).log_prob(torch.tensor([s_het,
+                                                                     s_hom]))
 
     if logit:
-        hs = torch.sigmoid(gene_property)
-    else:    # for calculating the posterior only
-        hs = gene_property
-    hs = torch.clamp(hs, EPS, 1-EPS)
+        s_het = torch.sigmoid(s_het)
+        s_hom = torch.sigmoid(s_hom)
+    s_het = torch.clamp(s_het, EPS, 1-EPS)
+    s_hom = torch.clamp(s_hom, EPS, 1-EPS)
 
-    lh = likelihood(hs, these_likelihoods)
+    lh = likelihood(s_het, s_hom, these_likelihoods)
 
     return (prior_p+lh, prior_p)
 
 
-def likelihood(hs, likelihoods):
+def likelihood(s_het, s_hom, likelihoods):
     '''
     p(y|parameter)
     '''
     S_GRID = torch.tensor(
-        [0.] + np.exp(np.linspace(np.log(1e-8), 0, num=100)).tolist(),
+        [0.] + np.exp(np.linspace(np.log(1e-5), 0, num=20)).tolist(),
         device=DEVICE
     )
-    likelihoods -= torch.max(likelihoods, dim=1, keepdim=True)[0]
+    likelihoods -= torch.max(
+        torch.max(likelihoods, dim=2, keepdim=True)[0],
+        dim=1, keepdim=True
+    )[0]
 
     with torch.no_grad():
-        left_idx = torch.searchsorted(S_GRID, hs, right=True) - 1
+        s_het_left_idx = torch.searchsorted(S_GRID, s_het, right=True) - 1
+        s_hom_left_idx = torch.searchsorted(S_GRID, s_hom, right=True) - 1
 
-    left_hs = S_GRID[left_idx]
-    right_hs = S_GRID[left_idx + 1]
+    left_s_het = S_GRID[s_het_left_idx]
+    right_s_het = S_GRID[s_het_left_idx + 1]
+    left_s_hom = S_GRID[s_hom_left_idx]
+    right_s_hom = S_GRID[s_hom_left_idx + 1]
 
-    idx0 = torch.arange(hs.shape[1])
-    left_likelihood = []
-    right_likelihood = []
+    idx0 = torch.arange(s_het.shape[1])
+    bottom_left_likelihood = []
+    bottom_right_likelihood = []
+    top_left_likelihood = []
+    top_right_likelihood = []
 
     for i in range(likelihoods.shape[0]):
-        likelihoods_curr = likelihoods[i].expand(hs.shape[1], -1)
-        left_likelihood.append(likelihoods_curr[idx0, left_idx[i, :]])
-        right_likelihood.append(likelihoods_curr[idx0, left_idx[i, :]+1])
+        likelihoods_curr = likelihoods[i].expand(s_het.shape[1], -1)
+        bottom_left_likelihood.append(
+            likelihoods_curr[
+                idx0, s_het_left_idx[i, :], s_hom_left_idx[i, :]
+            ]
+        )
+        bottom_right_likelihood.append(
+            likelihoods_curr[
+                idx0, s_het_left_idx[i, :]+1, s_hom_left_idx[i, :]
+            ]
+        )
+        top_left_likelihood.append(
+            likelihoods_curr[
+                idx0, s_het_left_idx[i, :], s_hom_left_idx[i, :]+1
+            ]
+        )
+        top_right_likelihood.append(
+            likelihoods_curr[
+                idx0, s_het_left_idx[i, :]+1, s_hom_left_idx[i, :]+1
+            ]
+        )
 
-    left_likelihood = torch.stack(left_likelihood)
-    right_likelihood = torch.stack(right_likelihood)
+    bottom_left_likelihood = torch.stack(bottom_left_likelihood)
+    bottom_right_likelihood = torch.stack(bottom_right_likelihood)
+    top_left_likelihood = torch.stack(top_left_likelihood)
+    top_right_likelihood = torch.stack(top_right_likelihood)
 
-    sp_1 = left_likelihood + torch.log((right_hs - hs) / (right_hs - left_hs))
-    sp_2 = right_likelihood + torch.log((hs - left_hs) / (right_hs - left_hs))
-    success_p = torch.exp(sp_1) + torch.exp(sp_2)
+    bottom_weight = (right_s_hom - s_hom) / (right_s_hom - left_s_hom)
+    left_weight = (right_s_het - s_het) / (right_s_het - left_s_het)
+
+    sp_bl = bottom_left_likelihood + torch.log(
+        bottom_weight * left_weight
+    )
+    sp_br = bottom_right_likelihood + torch.log(
+        bottom_weight * (1 - left_weight)
+    )
+    sp_tl = top_left_likelihood + torch.log(
+        (1-bottom_weight) * left_weight
+    )
+    sp_tr = top_right_likelihood + torch.log(
+        (1-bottom_weight) * (1-left_weight)
+     )
+    success_p = (
+        torch.exp(sp_bl)
+        + torch.exp(sp_br)
+        + torch.exp(sp_tl)
+        + torch.exp(sp_tr)
+    )
 
     return torch.log(torch.maximum(success_p, EPS))
 
 
 class Prior(RegressionDistn):
-    n_params = 2
-    positive = np.array([False, True])
+    n_params = 5
+    positive = np.array([False, False, True, True, False])
     scores = [PriorScore]
 
     def __init__(self, params):
@@ -374,21 +450,27 @@ class Prior(RegressionDistn):
         self.params_transf[Prior.positive] = np.exp(
            self.params_transf[Prior.positive]
         )
-        pass
 
     def distribution(params, logit=True):
+        means = torch.tensor([params[0], params[1]]).T
+        covs = torch.zeros((len(params[0]), 2, 2))
+        covs[:, 0, 0] = params[2]
+        covs[:, 1, 1] = params[3]
+        corrs = 2*torch.sigmoid(params[4]) - 1
+        covs[:, 0, 1] = torch.sqrt(params[2] * params[3]) * corrs
+        covs[:, 1, 0] = covs[:, 0, 1]
         if logit:
-            return dist.Normal(params[0], params[1])
+            return dist.MultivariateNormal(means, covs)
         else:
             return dist.TransformedDistribution(
-                dist.Normal(params[0], params[1]),
+                dist.MultivariateNormal(means, covs),
                 transforms=[dist.SigmoidTransform()])
 
     def get_mean(params):
-        return params[0]
+        return params[0], params[1]
 
     def get_sd(params):
-        return params[1]
+        return torch.sqrt(params[2]), torch.sqrt(params[3])
 
     def fit(y):
         """
@@ -396,7 +478,7 @@ class Prior(RegressionDistn):
         """
         print("fitting initial distribution...")
         params = []
-        for param in [0., np.log(1.)]:
+        for param in [0., 0., np.log(1.), np.log(1.), 0.]:
             params.append(
                 torch.tensor(param, requires_grad=True, device=DEVICE)
             )
@@ -432,6 +514,9 @@ class Prior(RegressionDistn):
                 "params",
                 params[0][0].item(),
                 params[1][0].item(),
+                params[2][0].item(),
+                params[3][0].item(),
+                params[4][0].item(),
                 "lr",
                 optimizer.param_groups[0]['lr']
             )
@@ -460,58 +545,109 @@ class Prior(RegressionDistn):
 
 
 def compute_posterior(these_params, y, prob_y):
-    result = 0
-    cdf = 0
-
     grid = torch.linspace(-1., 1., N_INTEGRATION_PTS).expand(1, -1)
-    means = Prior.get_mean(these_params)
-    sds = Prior.get_sd(these_params)
-    grid = means.expand(-1, 1) + grid * 8 * sds.expand(-1, 1)
+    means_s_het, means_s_hom = Prior.get_mean(these_params)
+    sds_s_het, sds_s_hom = Prior.get_sd(these_params)
+    grid_s_het = (
+        means_s_het.expand(-1, 1) + grid * 8 * sds_s_het.expand(-1, 1)
+    )
+    grid_s_hom = (
+        means_s_hom.expand(-1, 1) + grid * 8 * sds_s_hom.expand(-1, 1)
+    )
+
+    tile_grid_s_het = grid_s_het.repeat_interleave(len(grid_s_hom))
+    tile_grid_s_hom = grid_s_hom.repeat(len(grid_s_het))
 
     eval_at_pts, prior_p = log_prob(Prior.distribution,
                                     these_params,
-                                    y,
+                                    tile_grid_s_het,
+                                    tile_grid_s_hom,
                                     grid)
+    eval_at_pts = eval_at_pts.reshape(-1, len(grid_s_het), len(grid_s_hom))
 
     eval_at_pts -= torch.log(prob_y)
-    m = torch.max(eval_at_pts, dim=1, keepdim=True)[0]
+
+    m = torch.max(
+        torch.max(eval_at_pts, dim=1, keepdim=True)[0],
+        dim=2,
+        keepdim=True
+    )[0]
     pdf = eval_at_pts - m
 
-    # nonuniform posterior pdf (log)
-    grid_points_nonunif = torch.exp(
-        torch.linspace(
-            torch.log(torch.tensor(5e-8)),
-            torch.log(torch.tensor(0.995)),
-            steps=500)
-    ).unsqueeze(dim=0)
-    post_pdf_nonunif, _ = log_prob(Prior.distribution,
-                                   these_params,
-                                   y,
-                                   grid_points_nonunif,
-                                   logit=False)
-    post_pdf_nonunif = post_pdf_nonunif.squeeze()
-    post_pdf_nonunif -= torch.log(prob_y)
-
     # integral of g(x)f(x), where g = sigmoid
-    result += torch.exp(m.squeeze())*torch.trapezoid(
-        torch.exp(pdf)*torch.sigmoid(grid), grid, dim=1
+    pm_het = torch.exp(m.squeeze())*torch.trapezoid(
+        torch.trapezoid(
+            torch.exp(pdf)*torch.sigmoid(grid_s_het.expand(1, -1, 1)),
+            grid_s_hom,
+            dim=2
+        ),
+        grid_s_het,
+        dim=1
     )
-
-    cdf += torch.exp(m.squeeze())*torch.cumulative_trapezoid(
-        torch.exp(pdf), grid, dim=1
+    pm_hom = torch.exp(m.squeeze())*torch.trapezoid(
+        torch.trapezoid(
+            torch.exp(pdf)*torch.sigmoid(grid_s_hom.expand(1, 1, -1)),
+            grid_s_hom,
+            dim=2
+        ),
+        grid_s_het,
+        dim=1
     )
+    h_grid = (
+        torch.sigmoid(grid_s_het.expand(1, -1, 1))
+        / torch.sigmoid(grid_s_hom.expand(1, 1, -1))
+    )
+    pm_h = torch.exp(m.squeeze())*torch.trapezoid(
+        torch.trapezoid(
+            torch.exp(pdf)*h_grid,
+            grid_s_hom,
+            dim=2
+        ),
+        grid_s_het,
+        dim=1
+    )
+    sec_het = torch.exp(m.squeeze())*torch.trapezoid(
+        torch.trapezoid(
+            torch.exp(pdf)*torch.sigmoid(grid_s_het.expand(1, -1, 1))**2,
+            grid_s_hom,
+            dim=2
+        ),
+        grid_s_het,
+        dim=1
+    )
+    sec_hom = torch.exp(m.squeeze())*torch.trapezoid(
+        torch.trapezoid(
+            torch.exp(pdf)*torch.sigmoid(grid_s_hom.expand(1, 1, -1))**2,
+            grid_s_hom,
+            dim=2
+        ),
+        grid_s_het,
+        dim=1
+    )
+    sec_h = torch.exp(m.squeeze())*torch.trapezoid(
+        torch.trapezoid(
+            torch.exp(pdf)*h_grid**2,
+            grid_s_hom,
+            dim=2
+        ),
+        grid_s_het,
+        dim=1
+    )
+    pv_het = sec_het - pm_het**2
+    pv_hom = sec_hom - pm_hom**2
+    pv_h = sec_h - pm_h**2
 
-    lower = torch.argsort(torch.abs(cdf - 0.05))[0, 0]
-    upper = torch.argsort(torch.abs(cdf - 0.95))[0, 0]
-    lower = (grid[0, lower]+grid[0, lower+1])/2
-    upper = (grid[0, upper]+grid[0, upper+1])/2
-
-    lower = torch.sigmoid(lower)
-    upper = torch.sigmoid(upper)
-
-    m = torch.max(prior_p, dim=1, keepdim=True)[0]
+    m = torch.max(
+        torch.max(prior_p, dim=1, keepdim=True)[0],
+        dim=2,
+        keepdim=True
+    )[0]
     check = torch.exp(m.squeeze())*torch.trapezoid(
-        torch.exp(prior_p - m), grid, dim=1
+        torch.trapezoid(
+            torch.exp(prior_p - m), grid_s_hom, dim=2
+        ),
+        grid_s_het,
+        dim=1
     )
     if np.any(np.abs(check.detach().cpu().numpy() - 1.) > 1e-5):
         bad_idx = np.argmax(np.abs(check.detach().cpu().numpy()-1.))
@@ -520,11 +656,11 @@ def compute_posterior(these_params, y, prob_y):
               'found while integrating')
         print('params were', [p[bad_idx] for p in these_params])
         print(torch.exp(prior_p[bad_idx, 0]), torch.exp(prior_p[bad_idx, -1]))
-        print('mean was', means[bad_idx])
-        print('sd was', sds[bad_idx])
+        print('mean was', means_s_het[bad_idx], means_s_hom[bad_idx])
+        print('sd was', sds_s_het[bad_idx], sds_s_hom[bad_idx])
         print('grid was', grid[bad_idx])
 
-    return result, post_pdf_nonunif, lower, upper
+    return pm_het, pm_hom, pm_h, pv_het, pv_hom, pv_h
 
 
 def output_prior_posterior(model, feature_table, y, max_iter=None):
@@ -535,15 +671,26 @@ def output_prior_posterior(model, feature_table, y, max_iter=None):
                           device=DEVICE)
 
     # prior
-    prior_mean = torch.mean(
+    prior_samples = Prior.distribution(params, logit=False).sample(
+        torch.Size([10000])
+    )
+    prior_mean_s_het, prior_mean_s_hom = torch.mean(
+        prior_samples,
+        dim=0
+    )
+    prior_mean_h = torch.mean(prior_samples[:, 0] / prior_samples[:, 1])
+    prior_mean_s_het, prior_mean_s_hom = torch.mean(
         Prior.distribution(params, logit=False).sample(torch.Size([10000])),
         dim=0
     ).detach().cpu().numpy()
 
     # posterior
-    pdf = []
-    post_mean = []
-    lower_95, upper_95 = [], []
+    post_mean_s_het = []
+    post_mean_s_hom = []
+    post_mean_h = []
+    post_var_s_het = []
+    post_var_s_hom = []
+    post_var_h = []
 
     for idx in range(params.shape[1]):
         idx = torch.tensor([idx], device=DEVICE)
@@ -552,43 +699,34 @@ def output_prior_posterior(model, feature_table, y, max_iter=None):
         prob_y = integrate(params[:, idx].unsqueeze(dim=-1), y[idx])
 
         # compute posterior pdf + expected posterior gene_property
-        post, post_pdf, lower, upper = compute_posterior(
+        pm_het, pm_hom, pm_h, pv_het, pv_hom, pv_h = compute_posterior(
             params[:, idx].unsqueeze(dim=-1), y[idx], prob_y
         )
 
-        pdf.append(post_pdf.detach().cpu().numpy())
-        post_mean.append(post.item())
-        lower_95.append(lower.item())
-        upper_95.append(upper.item())
-
-    index = pd.DataFrame({"ensg": feature_table.index})
-    pdf = pd.DataFrame(
-        pdf,
-        columns=torch.exp(
-            torch.linspace(
-                torch.log(torch.tensor(5e-8)),
-                torch.log(torch.tensor(0.995)),
-                steps=500
-            )
-        ).detach().cpu().tolist()
-    )
-    pdf = pd.concat([index, pdf], axis=1)
-    pdf.to_csv(
-        args.out_prefix + ".posterior_density.tsv",
-        sep='\t',
-        index=None,
-        float_format='%g'
-    )
+        post_mean_s_het.append(pm_het.item())
+        post_mean_s_hom.append(pm_hom.item())
+        post_mean_h.append(pm_h.item())
+        post_var_s_het.append(pv_het.item())
+        post_var_s_hom.append(pv_hom.item())
+        post_var_h.append(pv_h.item())
 
     params = params.detach().cpu().numpy()
     output = pd.DataFrame({
         "ensg": feature_table.index,
         "param0": params[0],
         "param1": params[1],
-        "prior_mean": prior_mean,
-        "post_mean": post_mean,
-        "post_lower_95": lower_95,
-        "post_upper_95": upper_95
+        "param2": params[2],
+        "param3": params[3],
+        "param4": params[4],
+        "prior_mean_s_het": prior_mean_s_het,
+        "prior_mean_s_hom": prior_mean_s_hom,
+        "prior_mean_h": prior_mean_h,
+        "post_mean_s_het": post_mean_s_het,
+        "post_mean_s_hom": post_mean_s_hom,
+        "post_mean_h": post_mean_h,
+        "post_var_s_het": post_var_s_het,
+        "post_var_s_hom": post_var_s_hom,
+        "post_var_h": post_var_h
     })
     output.to_csv(
         args.out_prefix + ".per_gene_estimates.tsv", sep='\t', index=None
@@ -610,12 +748,14 @@ def format_lh(GENE_LIKELIHOODS, data, args):
     lh = []
     for gene in data.index:
         if gene not in GENE_LIKELIHOODS.keys():
-            lh.append(torch.zeros([101], device=DEVICE))
+            lh.append(torch.zeros([21, 21], device=DEVICE))
         else:
             lh_gene = (
-                GENE_LIKELIHOODS[gene]['stop_gained'][args.sg][:]
-                + GENE_LIKELIHOODS[gene]['splice_donor_variant'][args.sd][:]
-                + GENE_LIKELIHOODS[gene]['splice_acceptor_variant'][args.sa][:]
+                GENE_LIKELIHOODS[gene]['stop_gained'][args.sg][:, :]
+                + GENE_LIKELIHOODS[gene]['splice_donor_variant'][args.sd][:, :]
+                + GENE_LIKELIHOODS[gene]['splice_acceptor_variant'][args.sa][
+                    :, :
+                ]
             )
             lh.append(lh_gene.to(DEVICE))
     lh = torch.stack(lh)
